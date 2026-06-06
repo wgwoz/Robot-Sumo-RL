@@ -27,7 +27,7 @@ I have modified reward function extensivley and trained 3 models. SAC, SAC128 an
 
 Most of the work was made by Sebastian, the original author, I have adapted his codebase to my needs. I have used help of copilot and codebase is not tidy rn
 
-
+## Rest of original readme
 > [!IMPORTANT]
 >  State-of-the-Art (SOTA) Implementation: As of January 2026, this repository represents the most advanced open-source framework for Robot Sumo combat, being the first to provide a comprehensive benchmark of SAC, PPO, and A2C algorithms integrated with a competitive self-play mechanism.
 
