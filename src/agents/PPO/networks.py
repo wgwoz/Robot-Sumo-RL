@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class ActorCriticNet(nn.Module):
-    def __init__(self, obs_size=11, h1=128, h2=128):
+    def __init__(self, obs_size=13, h1=128, h2=128):
         super().__init__()
         self.base = nn.Sequential(
             nn.Linear(obs_size, h1),

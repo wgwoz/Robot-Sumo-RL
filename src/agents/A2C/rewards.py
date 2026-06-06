@@ -1,52 +1,31 @@
 def get_reward(env, info, done, state_vec, is_collision):
     if done:
         winner = info.get("winner")
-        if winner == 1:
-            return 50.0
-        if winner == 2:
-            return -30.0
-        return -20.0  # Penalty for a draw (timeout/passive play)
+        if winner == 1: return 50.0
+        if winner == 2: return -30.0
+        return -20.0
 
     r = 0.0
     v_fwd = state_vec[0]
-    v_side = state_vec[1]
-    omega = abs(state_vec[2])
-    dist_opp = state_vec[5]
-    cos_to_opp = state_vec[7]
-    dist_edge_norm = state_vec[8]
-    cos_to_center = state_vec[10]
+    dist_center_opp = state_vec[4] # Front-Center sensor
+    on_line = state_vec[8]
 
-    # Reward forward velocity to encourage movement
-    if v_fwd > 0.2:
-        r += 0.03 * v_fwd
+    # Reward moving forward IF the center sensor sees the opponent (accurate aiming)
+    if v_fwd > 0.2 and dist_center_opp < 0.5:
+        r += 0.05 * (1.0 - dist_center_opp)
 
     if is_collision:
-        # Penalty for side-collision (anti-dancing)
-        if cos_to_opp < 0.6:
-            r -= 0.15
-        else:
-            # Reward pushing with the front of the robot
+        # Reward high-speed collision if we are facing them (center sensor is low)
+        if dist_center_opp < 0.3:
             r += 0.5 * v_fwd
+        else:
+            r -= 0.2 # Penalty for side-impacts (anti-dancing)
 
-            # Bonus for pushing the opponent towards the edge
-            if dist_edge_norm < 0.5 and cos_to_opp > 0.9:
-                r += 0.1 * (1.0 - dist_edge_norm)
-    else:
-        # Reward tracking and approaching the opponent
-        if cos_to_opp > 0.8:
-            r += 0.02 * cos_to_opp
+    # Line safety: If on the line, reward moving AWAY from it (facing center)
+    # Since we don't have center-angle anymore, we penalize staying on the line
+    if on_line > 0.5:
+        r -= 0.5 
 
-    # Penalty for excessive rotation without forward movement
-    if omega > 0.5 and v_fwd < 0.2:
-        r -= 0.1 * omega
-
-    # Survival logic: penalty for facing the wrong way near the edge
-    if dist_edge_norm < 0.25:
-        danger = (0.25 - dist_edge_norm) / 0.25
-        if cos_to_center < 0:
-            r -= 0.4 * danger
-
-    # Time penalty to encourage faster victories
+    # Time penalty
     r -= 0.03
-
     return float(r)

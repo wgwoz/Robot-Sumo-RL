@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.agents.SAC.networks import GaussianActor, QNetwork
+from src.agents.SAC128.networks import GaussianActor, QNetwork
 
 
 class ReplayBuffer:
@@ -40,8 +40,8 @@ def soft_update(target, source, tau):
         target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
 
-class SACAgent(nn.Module):
-    def __init__(self, obs_size, action_dim, device, hidden_dim=256, lr=3e-4):
+class SAC128Agent(nn.Module):
+    def __init__(self, obs_size, action_dim, device, hidden_dim=128, lr=3e-4):
         super().__init__()
         self.device = device
         self.action_dim = action_dim

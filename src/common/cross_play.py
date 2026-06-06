@@ -7,9 +7,13 @@ import torch
 
 from src.agents.A2C.networks import ActorCriticNet
 from src.agents.A2C.networks import select_action as a2c_select
-from src.agents.A2C.rewards import get_reward
+from src.agents.A2C.rewards import get_reward as get_a2c_reward
 from src.agents.PPO.agent import create_agent as create_ppo_agent
+from src.agents.PPO.rewards import get_reward as get_ppo_reward
 from src.agents.SAC.networks import GaussianActor as SACActor
+from src.agents.SAC.rewards import get_reward as get_sac_reward
+from src.agents.SAC128.networks import GaussianActor as SAC128Actor
+from src.agents.SAC128.rewards import get_reward as get_sac128_reward
 from src.env.sumo_env import SumoEnv
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -20,13 +24,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 PLAYER_1_TYPE = "ai"
 PLAYER_1_ARCH = "sac"
-MODEL_1_PATH = "models/favourite/SAC/model_v23.pt"
+MODEL_1_PATH = "models/sac_sumo_master_fajnyyv2.pt"
 
 PLAYER_2_TYPE = "ai"
-PLAYER_2_ARCH = "a2c"
-MODEL_2_PATH = "models/favourite/A2C/model_v427.pt"
+PLAYER_2_ARCH = "sac128"
+MODEL_2_PATH = "models/SAC128_sumo_master_128.pt"
 
-MAX_STEPS = 1000
+MAX_STEPS = 100000
 
 # --- PLOT INITIALIZATION ---
 plt.rcParams["toolbar"] = "None"
@@ -43,7 +47,43 @@ ax.legend()
 ax.grid(True, alpha=0.3)
 
 
+def _load_actor_weights(model, sd):
+    actor_sd = {}
+    if any(k.startswith("actor.") for k in sd.keys()):
+        for k, v in sd.items():
+            if k.startswith("actor."):
+                actor_sd[k[6:]] = v
+    else:
+        actor_sd = sd
+
+    own_state = model.state_dict()
+    loaded = 0
+    for key, value in actor_sd.items():
+        if key in own_state and own_state[key].shape == value.shape:
+            own_state[key].copy_(value)
+            loaded += 1
+        elif key in own_state:
+            print(f"Skipping incompatible key {key}: {value.shape} -> {own_state[key].shape}")
+
+    if loaded == 0:
+        raise RuntimeError("No compatible actor weights were loaded.")
+
+    return model
+
+
 def load_ai_model(path, arch, device):
+    if not os.path.exists(path):
+        if arch == "sac128":
+            for alt in [
+                "models/SAC128_sumo_master_128.pt",
+                "models/SAC128_sumo_master.pt",
+                "models/sac128_sumo_master.pt",
+            ]:
+                if os.path.exists(alt):
+                    print(f"Model not found: {path}. Falling back to {alt}")
+                    path = alt
+                    break
+
     if not os.path.exists(path):
         print(f"Model not found: {path}")
         return None
@@ -55,19 +95,14 @@ def load_ai_model(path, arch, device):
             model = ActorCriticNet(obs_size=11).to(device)
             model.load_state_dict(sd)
         elif arch == "ppo":
-            model = create_ppo_agent(11, 128).to(device)
+            model = create_ppo_agent(13, 128).to(device)
             model.load_state_dict(sd)
         elif arch == "sac":
-            model = SACActor(obs_size=11, action_dim=2).to(device)
-
-            actor_sd = {}
-            if any(k.startswith("actor.") for k in sd.keys()):
-                for k, v in sd.items():
-                    if k.startswith("actor."):
-                        actor_sd[k[6:]] = v
-            else:
-                actor_sd = sd
-            model.load_state_dict(actor_sd)
+            model = SACActor(obs_size=13, action_dim=2).to(device)
+            model = _load_actor_weights(model, sd)
+        elif arch == "sac128":
+            model = SAC128Actor(obs_size=13, action_dim=2).to(device)
+            model = _load_actor_weights(model, sd)
         else:
             return None
 
@@ -119,7 +154,38 @@ def get_action(p_type, arch, robot_idx, state, model):
                 obs_t = torch.FloatTensor(obs_vec).to(DEVICE).unsqueeze(0)
                 _, _, mu = model.sample(obs_t)
                 return mu.cpu().numpy().flatten()
+            elif arch == "sac128":
+                obs_t = torch.FloatTensor(obs_vec).to(DEVICE).unsqueeze(0)
+                _, _, mu = model.sample(obs_t)
+                return mu.cpu().numpy().flatten()
     return [0.0, 0.0]
+
+
+class RewardEnvProxy:
+    def __init__(self, env, swap=False):
+        self.ARENA_RADIUS = env.ARENA_RADIUS
+        if swap:
+            self.robot1 = env.robot2
+            self.robot2 = env.robot1
+        else:
+            self.robot1 = env.robot1
+            self.robot2 = env.robot2
+
+
+REWARD_FN_BY_ARCH = {
+    "a2c": get_a2c_reward,
+    "ppo": get_ppo_reward,
+    "sac": get_sac_reward,
+    "sac128": get_sac128_reward,
+}
+
+
+def get_reward_for_arch(arch, env, info, done, state_vec, is_collision, swap=False):
+    reward_fn = REWARD_FN_BY_ARCH.get(arch.lower())
+    if reward_fn is None:
+        raise ValueError(f"Unknown reward architecture: {arch}")
+    proxy_env = RewardEnvProxy(env, swap=swap)
+    return reward_fn(proxy_env, info, done, state_vec, is_collision)
 
 
 def main():
@@ -172,11 +238,23 @@ def main():
             elif info.get("winner") == 2:
                 info_r2["winner"] = 1
 
-            r1_s = get_reward(
-                None, info, done, state[0], info.get("is_collision", False)
+            r1_s = get_reward_for_arch(
+                PLAYER_1_ARCH,
+                env,
+                info,
+                done,
+                state[0],
+                info.get("is_collision", False),
+                swap=False,
             )
-            r2_s = get_reward(
-                None, info_r2, done, state[1], info.get("is_collision", False)
+            r2_s = get_reward_for_arch(
+                PLAYER_2_ARCH,
+                env,
+                info_r2,
+                done,
+                state[1],
+                info.get("is_collision", False),
+                swap=True,
             )
 
             total_r1 += r1_s

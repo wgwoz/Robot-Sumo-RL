@@ -6,20 +6,20 @@ import numpy as np
 import pygame
 import torch
 
-from src.agents.SAC.networks import GaussianActor
-from src.agents.SAC.rewards import get_reward
+from src.agents.SAC128.networks import GaussianActor
+from src.agents.SAC128.rewards import get_reward
 from src.env.sumo_env import SumoEnv
-from src.agents.SAC.heuristic_actor import HeuristicActor # <--- ADDED THIS IMPORT
+from src.agents.SAC128.heuristic_actor import HeuristicActor # <--- ADDED THIS IMPORT
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- TEST CONFIG ---
 # You can now set these to "heuristic" or a path to a .pt file
 PLAYER_1_TYPE = "ai"
-MODEL_1_PATH = "models/model_v5.pt" # Change to "models/sac_sumo_master.pt" to use AI
+MODEL_1_PATH = "models/SAC128_sumo_master_128.pt" # Change to "models/SAC128_sumo_master_128.pt" to use AI
 
 PLAYER_2_TYPE = "ai"
-MODEL_2_PATH = "models/sac_sumo_master_fajnyyv2.pt" # Change to "models/sac_sumo_master.pt" to use AI
+MODEL_2_PATH = "models/SAC_sumo_master.pt" # Change to "models/SAC128_sumo_master.pt" to use AI
 
 MAX_STEPS = 1000
 
@@ -36,7 +36,7 @@ ax.legend()
 ax.grid(True, alpha=0.3)
 
 
-def load_sac_actor(path, device):
+def load_SAC128_actor(path, device):
     # Check if path is "heuristic_Someting" (e.g., "heuristic_Aggressive")
     if isinstance(path, str) and path.startswith("heuristic_"):
         strategy_name = path.replace("heuristic_", "")
@@ -67,7 +67,7 @@ def load_sac_actor(path, device):
         model.eval()
         return model
     except Exception as e:
-        print(f"SAC loading error: {e}")
+        print(f"SAC128 loading error: {e}")
         return None
 
 
@@ -91,7 +91,7 @@ def get_action(p_type, robot_idx, state, model):
         return [v, omega]
 
     if p_type == "ai" and model:
-        # The model.sample() function handles both Heuristic and SAC
+        # The model.sample() function handles both Heuristic and SAC128
         obs = torch.FloatTensor(state[robot_idx]).to(DEVICE).unsqueeze(0)
         with torch.no_grad():
             _, _, mu = model.sample(obs)
@@ -101,14 +101,14 @@ def get_action(p_type, robot_idx, state, model):
 
 def main():
     env = SumoEnv(render_mode=True)
-    model1 = load_sac_actor(MODEL_1_PATH, DEVICE) if PLAYER_1_TYPE == "ai" else None
-    model2 = load_sac_actor(MODEL_2_PATH, DEVICE) if PLAYER_2_TYPE == "ai" else None
+    model1 = load_SAC128_actor(MODEL_1_PATH, DEVICE) if PLAYER_1_TYPE == "ai" else None
+    model2 = load_SAC128_actor(MODEL_2_PATH, DEVICE) if PLAYER_2_TYPE == "ai" else None
 
     scores = [0, 0]
     round_count = 0
 
     print(
-        f"TEST SAC: {MODEL_1_PATH} vs {MODEL_2_PATH}"
+        f"TEST SAC128: {MODEL_1_PATH} vs {MODEL_2_PATH}"
     )
 
     while True:
@@ -172,8 +172,8 @@ def main():
             step_count += 1
             env.render(
                 names=[MODEL_1_PATH, MODEL_2_PATH],
-                archs=["SAC" if ".pt" in MODEL_1_PATH else "HEURISTIC", 
-                       "SAC" if ".pt" in MODEL_2_PATH else "HEURISTIC"],
+                archs=["SAC128" if ".pt" in MODEL_1_PATH else "HEURISTIC", 
+                       "SAC128" if ".pt" in MODEL_2_PATH else "HEURISTIC"],
             )
 
         round_count += 1
@@ -190,9 +190,9 @@ def main():
 
         # Hot-reload (only if it's a file, otherwise keep the heuristic object)
         if PLAYER_1_TYPE == "ai" and ".pt" in MODEL_1_PATH:
-            model1 = load_sac_actor(MODEL_1_PATH, DEVICE)
+            model1 = load_SAC128_actor(MODEL_1_PATH, DEVICE)
         if PLAYER_2_TYPE == "ai" and ".pt" in MODEL_2_PATH:
-            model2 = load_sac_actor(MODEL_2_PATH, DEVICE)
+            model2 = load_SAC128_actor(MODEL_2_PATH, DEVICE)
 
 
 if __name__ == "__main__":

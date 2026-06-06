@@ -93,37 +93,38 @@ class SumoRenderer:
             3,
         )
 
-    def draw_observations_visual(self, robots, observations):
-        if not self.show_sensors or observations is None:
-            return
+   #
+    #def draw_observations_visual(self, robots, observations):
+    #    if not self.show_sensors or observations is None:
+    #        return
+#
+ #       for i, (robot, obs) in enumerate(zip(robots, observations)):
+ #           global_angle_rad = math.atan2(obs[3], obs[4])
+#            start_pos = self._to_screen(robot.x, robot.y)
+#
+ #           d_opp_px = obs[5] * (ARENA_RADIUS * 2)
+ #           rel_angle_opp = math.atan2(obs[6], obs[7])
+ #           total_angle_opp = global_angle_rad + rel_angle_opp
+#
+ #           target_opp_x = robot.x + math.cos(total_angle_opp) * d_opp_px
+  #          target_opp_y = robot.y + math.sin(total_angle_opp) * d_opp_px
+  #          pygame.draw.line(
+  #              self.screen,
+  #              (0, 200, 0),
+   #             start_pos,
+   #             self._to_screen(target_opp_x, target_opp_y),
+   #             1,
+    #        )
+#
+    #        d_edge_px = obs[8] * ARENA_RADIUS
+   #         rel_angle_cntr = math.atan2(obs[9], obs[10])
+   #         total_angle_cntr = global_angle_rad + rel_angle_cntr
 
-        for i, (robot, obs) in enumerate(zip(robots, observations)):
-            global_angle_rad = math.atan2(obs[3], obs[4])
-            start_pos = self._to_screen(robot.x, robot.y)
-
-            d_opp_px = obs[5] * (ARENA_RADIUS * 2)
-            rel_angle_opp = math.atan2(obs[6], obs[7])
-            total_angle_opp = global_angle_rad + rel_angle_opp
-
-            target_opp_x = robot.x + math.cos(total_angle_opp) * d_opp_px
-            target_opp_y = robot.y + math.sin(total_angle_opp) * d_opp_px
-            pygame.draw.line(
-                self.screen,
-                (0, 200, 0),
-                start_pos,
-                self._to_screen(target_opp_x, target_opp_y),
-                1,
-            )
-
-            d_edge_px = obs[8] * ARENA_RADIUS
-            rel_angle_cntr = math.atan2(obs[9], obs[10])
-            total_angle_cntr = global_angle_rad + rel_angle_cntr
-
-            edge_x = robot.x - math.cos(total_angle_cntr) * d_edge_px
-            edge_y = robot.y - math.sin(total_angle_cntr) * d_edge_px
-            pygame.draw.line(
-                self.screen, (255, 0, 0), start_pos, self._to_screen(edge_x, edge_y), 2
-            )
+    #        edge_x = robot.x - math.cos(total_angle_cntr) * d_edge_px
+    #        edge_y = robot.y - math.sin(total_angle_cntr) * d_edge_px
+    #        pygame.draw.line(
+    #            self.screen, (255, 0, 0), start_pos, self._to_screen(edge_x, edge_y), 2
+    #        )
 
     def draw_ui(self, robots, observations=None, names=None, archs=None):
         if not self.show_ui:
@@ -135,18 +136,21 @@ class SumoRenderer:
         ]
 
         labels_info = [
-            ("V", "fwd"),
-            ("V", "side"),
-            ("ω", ""),
-            ("sin(θ)", ""),
-            ("cos(θ)", ""),
-            ("L", "opp"),
-            ("sin(opp)", ""),
-            ("cos(opp)", ""),
-            ("L", "edge"),
-            ("sin(cntr)", ""),
-            ("cos(cntr)", ""),
+            ("W", "Left"),  # Wheel Left
+            ("W", "Right"), # Wheel Right
+            ("ω", "Gyro"),  # Omega
+            ("C", "CL"),    # Current Left
+            ("C", "CR"),    # Current Right
+            ("S", "FL"),    # Sensor Front-Left
+            ("S", "FC"),    # Sensor Front-Center
+            ("S", "FR"),    # Sensor Front-Right
+            ("S", "L"),     # Sensor Left
+            ("S", "R"),     # Sensor Right
+            ("L", "L-FL"),  # Line Front-Left
+            ("L", "L-FR"),  # Line Front-Right
+            ("L", "L-BC"),  # Line Back-Center
         ]
+
 
         font_sub = pygame.font.SysFont("Consolas", 10, bold=True)
         font_info = pygame.font.SysFont("Consolas", 11, bold=False)
@@ -214,7 +218,7 @@ class SumoRenderer:
             return
 
         ui_positions = [20, WIDTH - 205]
-        labels = ["LINEAR", "ANGULAR"]
+        labels = ["LMotor", "RMotor"]
 
         for i, (action, x_pos) in enumerate(zip(actions, ui_positions)):
             curr_y = 290

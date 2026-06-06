@@ -33,7 +33,7 @@ ax.grid(True, alpha=0.3)
 def load_ai_model(path, device):
     if not os.path.exists(path):
         return None
-    model = create_agent(11, 128).to(device)
+    model = create_agent(13, 128).to(device)
     try:
         model.load_state_dict(torch.load(path, map_location=device))
         model.eval()

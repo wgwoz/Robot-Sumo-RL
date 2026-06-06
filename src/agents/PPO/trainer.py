@@ -1,8 +1,11 @@
 import glob
 import os
 import random
+import sys
+import multiprocessing
 from collections import deque
 
+import numpy as np
 import pygame
 import torch
 import torch.optim as optim
@@ -16,18 +19,22 @@ from src.agents.PPO.agent import (
 from src.agents.PPO.rewards import get_reward
 from src.env.sumo_env import SumoEnv
 
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+
 cfg = {
     "lr": 3e-4,
     "gamma": 0.99,
-    "ppo_epochs": 10,  # Number of optimization epochs per update cycle
-    "eps_clip": 0.2,  # Clipping parameter for the policy objective to prevent large updates
-    "entropy_coef": 0.01,  # Weight of the entropy bonus to encourage exploration
-    "update_every_steps": 2048,  # Total steps collected before performing an update
-    "max_steps": 1000,
+    "ppo_epochs": 10,
+    "eps_clip": 0.2,
+    "entropy_coef": 0.01,
+    "update_every_steps": 2048,
+    "max_steps": 600,
     "episodes": 100000,
     "render": False,
-    "master_path": "models/ppo_push_master.pt",
-    "model_dir": "models/",
+    "num_workers": 4,
+    "obs_size": 13,
+    "master_path": os.path.join(ROOT_DIR, "models/ppo_sumo_master.pt"),
+    "model_dir": os.path.join(ROOT_DIR, "models/"),
 }
 
 
@@ -35,12 +42,96 @@ def get_history_models(dir):
     return glob.glob(os.path.join(dir, "model_v*.pt"))
 
 
+def collect_episode(agent_state, opp_path, cfg, total_steps):
+    device = torch.device("cpu")
+    model = create_agent(cfg["obs_size"], 128).to(device)
+    model.load_state_dict(agent_state)
+    model.eval()
+
+    opp_net = create_agent(cfg["obs_size"], 128).to(device).eval()
+    if os.path.exists(opp_path):
+        opp_net.load_state_dict(torch.load(opp_path, map_location=device))
+
+    env = SumoEnv(render_mode=False)
+    state_vecs = env.reset(randPositions=True)
+
+    done = False
+    episode_reward = 0.0
+    episode_steps = 0
+
+    states, actions, log_probs, values, rewards, masks = [], [], [], [], [], []
+
+    while not done and episode_steps < cfg["max_steps"]:
+        s_t = torch.FloatTensor(state_vecs[0]).to(device).unsqueeze(0)
+        opp_s_t = torch.FloatTensor(state_vecs[1]).to(device).unsqueeze(0)
+
+        with torch.no_grad():
+            action_params, value_pred = model(s_t)
+            dist = get_distribution(action_params)
+            action = dist.sample()
+            log_prob = dist.log_prob(action).sum(dim=-1)
+
+            opp_params, _ = opp_net(opp_s_t)
+            opp_dist = get_distribution(opp_params)
+            opp_action = opp_dist.sample()
+
+        act_np = torch.clamp(action, -1.0, 1.0).cpu().numpy()[0]
+        opp_act_np = torch.clamp(opp_action, -1.0, 1.0).cpu().numpy()[0]
+
+        next_state_vecs, _, env_done, info = env.step(act_np, opp_act_np)
+        episode_steps += 1
+        done = env_done or episode_steps >= cfg["max_steps"]
+        if episode_steps >= cfg["max_steps"]:
+            info["winner"] = 0
+
+        rew = get_reward(
+            env,
+            info,
+            done,
+            next_state_vecs[0],
+            info.get("is_collision", False),
+        )
+
+        states.append(state_vecs[0].astype(np.float32))
+        actions.append(act_np.astype(np.float32))
+        log_probs.append(log_prob.item())
+        values.append(value_pred.item())
+        rewards.append(rew)
+        masks.append(1.0 - float(done))
+
+        episode_reward += rew
+        state_vecs = next_state_vecs
+
+    if done:
+        last_value = 0.0
+    else:
+        with torch.no_grad():
+            _, last_value = model(
+                torch.FloatTensor(state_vecs[0]).to(device).unsqueeze(0)
+            )
+            last_value = last_value.item()
+
+    returns = calculate_returns(rewards, cfg["gamma"], last_value, masks).cpu().numpy().astype(np.float32)
+    advantages = returns - np.array(values, dtype=np.float32)
+
+    return {
+        "states": np.stack(states, axis=0),
+        "actions": np.stack(actions, axis=0),
+        "log_probs": np.array(log_probs, dtype=np.float32),
+        "advantages": advantages,
+        "returns": returns,
+        "episode_reward": episode_reward,
+        "winner": int(info.get("winner", 0)),
+        "steps": episode_steps,
+    }
+
+
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     history_dir = os.path.join(cfg["model_dir"], "history/PPO")
     os.makedirs(history_dir, exist_ok=True)
 
-    model = create_agent(11, 128).to(device)
+    model = create_agent(cfg["obs_size"], 128).to(device)
 
     if os.path.exists(cfg["master_path"]):
         model.load_state_dict(torch.load(cfg["master_path"], map_location=device))
@@ -50,129 +141,105 @@ def train():
         torch.save(model.state_dict(), cfg["master_path"])
 
     optimizer = optim.Adam(model.parameters(), lr=cfg["lr"])
-    opp_net = create_agent(11, 128).to(device).eval()
 
     win_history = deque(maxlen=100)
     last_update_ep = 0
     buffer_steps = 0
     storage = {"s": [], "a": [], "lp": [], "ad": [], "rt": []}
-    env = SumoEnv(render_mode=cfg["render"])
+    total_steps = 0
 
-    # Master update thresholds (WR, min_ep_break, max_draws)
     c_list = [
-        (0.51, 40, 50),
-        (0.52, 36, 49),
-        (0.53, 32, 48),
-        (0.54, 28, 47),
-        (0.55, 24, 46),
-        (0.56, 20, 45),
-        (0.57, 16, 44),
-        (0.58, 12, 43),
-        (0.59, 8, 42),
+        (0.51, 40, 90),
+        (0.52, 36, 80),
+        (0.53, 32, 75),
+        (0.54, 28, 70),
+        (0.55, 24, 65),
+        (0.56, 20, 60),
+        (0.57, 16, 55),
+        (0.58, 12, 50),
+        (0.59, 8, 45),
         (0.60, 5, 40),
     ]
 
+    pool = multiprocessing.Pool(cfg["num_workers"])
+
     try:
-        for ep in range(cfg["episodes"]):
+        for ep in range(0, cfg["episodes"], cfg["num_workers"]):
             hist = get_history_models(history_dir)
             is_master = random.random() >= 0.20 or not hist
             opp_path = cfg["master_path"] if is_master else random.choice(hist)
             opp_name = "MASTER" if is_master else os.path.basename(opp_path)
 
-            opp_net.load_state_dict(torch.load(opp_path, map_location=device))
+            if ep > 0 and ep % 1000 == 0:
+                val_env = SumoEnv(render_mode=True)
+                val_state = val_env.reset(randPositions=True)
+                val_done = False
+                val_steps = 0
 
-            state_vecs = env.reset(randPositions=True)
-            done, ep_rew, ep_steps = False, 0, 0
-            ep_data = {"s": [], "a": [], "lp": [], "v": [], "r": [], "m": []}
+                opp_net = create_agent(cfg["obs_size"], 128).to(device).eval()
+                if os.path.exists(cfg["master_path"]):
+                    opp_net.load_state_dict(torch.load(cfg["master_path"], map_location=device))
 
-            while not done:
-                if cfg["render"]:
-                    env.render()
-                    for event in pygame.event.get():
-                        if event.type == pygame.QUIT:
-                            return
+                while not val_done and val_steps < cfg["max_steps"]:
+                    if pygame.event.peek(pygame.QUIT):
+                        break
 
-                s_t = torch.as_tensor(
-                    state_vecs[0], dtype=torch.float32, device=device
-                ).unsqueeze(0)
-                opp_s_t = torch.as_tensor(
-                    state_vecs[1], dtype=torch.float32, device=device
-                ).unsqueeze(0)
+                    s_t = torch.FloatTensor(val_state[0]).unsqueeze(0).to(device)
+                    opp_s_t = torch.FloatTensor(val_state[1]).unsqueeze(0).to(device)
 
-                with torch.no_grad():
-                    a_p, v_p = model(s_t)
-                    dist = get_distribution(a_p)
-                    act = dist.sample()
-                    o_p, _ = opp_net(opp_s_t)
-                    o_act = get_distribution(o_p).sample()
+                    with torch.no_grad():
+                        a_p, _ = model(s_t)
+                        a_dist = get_distribution(a_p)
+                        action = a_dist.sample()
 
-                act_np = torch.clamp(act, -1, 1).cpu().numpy()[0]
-                o_act_np = torch.clamp(o_act, -1, 1).cpu().numpy()[0]
+                        o_p, _ = opp_net(opp_s_t)
+                        o_dist = get_distribution(o_p)
+                        opp_action = o_dist.sample()
 
-                next_state_vecs, _, env_done, info = env.step(act_np, o_act_np)
+                    act_np = torch.clamp(action, -1.0, 1.0).cpu().numpy()[0]
+                    opp_act_np = torch.clamp(opp_action, -1.0, 1.0).cpu().numpy()[0]
 
-                ep_steps += 1
-                if ep_steps >= cfg.get("max_steps", 1000):
-                    done = True
-                    info["winner"] = 0  # Time is out
-                else:
-                    done = env_done
+                    val_state, _, val_done, info = val_env.step(act_np, opp_act_np)
+                    val_env.render(names=["Training AI", "Master"], archs=["PPO", "PPO"])
+                    val_steps += 1
 
-                rew = get_reward(
-                    None,
-                    info,
-                    done,
-                    next_state_vecs[0],
-                    info.get("is_collision", False),
-                )
+                pygame.display.quit()
 
-                # Save the data
-                ep_data["s"].append(s_t)
-                ep_data["a"].append(act)
-                ep_data["lp"].append(dist.log_prob(act).sum(-1))
-                ep_data["v"].append(v_p)
-                ep_data["r"].append(rew)
-                ep_data["m"].append(1.0 - float(done))
+            agent_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            results = [
+                pool.apply_async(collect_episode, (agent_state, opp_path, cfg, total_steps))
+                for _ in range(cfg["num_workers"])
+            ]
 
-                state_vecs, ep_rew, buffer_steps = (
-                    next_state_vecs,
-                    ep_rew + rew,
-                    buffer_steps + 1,
-                )
+            episodes = [r.get() for r in results]
 
-            # Calculate returns for PPO
-            with torch.no_grad():
-                _, last_v = model(
-                    torch.as_tensor(
-                        state_vecs[0], dtype=torch.float32, device=device
-                    ).unsqueeze(0)
-                )
+            all_rewards = []
+            winners = []
+            for episode in episodes:
+                storage["s"].append(torch.from_numpy(episode["states"]).to(device))
+                storage["a"].append(torch.from_numpy(episode["actions"]).to(device))
+                storage["lp"].append(torch.from_numpy(episode["log_probs"]).to(device))
+                storage["ad"].append(torch.from_numpy(episode["advantages"]).to(device))
+                storage["rt"].append(torch.from_numpy(episode["returns"]).to(device))
 
-            rets = calculate_returns(
-                ep_data["r"], cfg["gamma"], last_v.item(), ep_data["m"]
-            ).to(device)
-            advs = rets - torch.cat(ep_data["v"]).squeeze(-1)
+                episode_len = episode["steps"]
+                buffer_steps += episode_len
+                total_steps += episode_len
+                all_rewards.append(episode["episode_reward"])
+                winners.append(episode["winner"])
 
-            storage["s"].append(torch.cat(ep_data["s"]))
-            storage["a"].append(torch.cat(ep_data["a"]))
-            storage["lp"].append(torch.cat(ep_data["lp"]))
-            storage["ad"].append(advs)
-            storage["rt"].append(rets)
+            avg_rew = sum(all_rewards) / len(all_rewards)
 
-            # --- LOGIN AND STATISTICS ---
-            winner = info.get("winner", 0)
             if is_master:
-                win_history.append(
-                    1.0 if winner == 1 else (0.5 if winner == 0 else 0.0)
-                )
+                for winner in winners:
+                    win_history.append(1.0 if winner == 1 else (0.5 if winner == 0 else 0.0))
 
-            wr = sum(win_history) / len(win_history) if win_history else 0
-            status = "WIN" if winner == 1 else ("LOSE" if winner == 2 else "DRAW")
-            print(
-                f"Ep {ep:04d} | Steps: {ep_steps:4} | vs {opp_name:12} | Reward: {ep_rew:7.2f} | WR: {wr:.2%} | {status}"
+            wr = sum(win_history) / len(win_history) if win_history else 0.0
+            sys.stdout.write(
+                f"Ep {ep:04d}-{ep+cfg['num_workers']-1:04d} | vs {opp_name:12} | WR: {wr:.2%} | Rew: {avg_rew:7.2f}\r"
             )
+            sys.stdout.flush()
 
-            # --- NETWORK UPDATE (PPO) ---
             if buffer_steps >= cfg["update_every_steps"]:
                 adv_b = torch.cat(storage["ad"]).detach()
                 update_policy(
@@ -189,9 +256,8 @@ def train():
                 )
                 storage = {k: [] for k in storage}
                 buffer_steps = 0
-                print("--- [Policy Updated] ---")
+                print("\n--- [Policy Updated] ---")
 
-            # --- MASTER UPDATE LOGIC ---
             if len(win_history) >= 100:
                 draw_count = sum(1 for score in win_history if score == 0.5)
                 update_triggered = False
@@ -213,10 +279,12 @@ def train():
                     )
                     last_update_ep = ep
                     print(
-                        f"🔥 [NEW MASTER] v{ver} WR: {wr:.2%} | Draws: {draw_count} | Ep: {ep}"
+                        f"\n🔥 [NEW MASTER] v{ver} WR: {wr:.2%} | Draws: {draw_count} | Ep: {ep}"
                     )
 
     finally:
+        pool.close()
+        pool.join()
         pygame.quit()
 
 

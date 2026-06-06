@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 import pygame
+import torch
 
 from src.env.collisions import check_sat_collision, get_robot_global_velocity
 from src.env.config import *
@@ -44,15 +45,14 @@ class SumoEnv:
 
         self.reset()
 
-    def reset(self, randPositions=False):
+    def reset(self, randPositions=True):
         if self.renderer:
             self.renderer.clear_trails()
 
         r1_cfg, r2_cfg = self._generate_start_positions(randPositions)
 
-        self.robot1 = SumoRobot(x=r1_cfg["x"], y=r1_cfg["y"], angle=r1_cfg["angle"])
-        self.robot2 = SumoRobot(x=r2_cfg["x"], y=r2_cfg["y"], angle=r2_cfg["angle"])
-
+        self.robot1 = SumoRobot(x=r1_cfg["x"], y=r1_cfg["y"], angle=r1_cfg["angle"], mass=ROBOT_MASS)
+        self.robot2 = SumoRobot(x=r2_cfg["x"], y=r2_cfg["y"], angle=r2_cfg["angle"], mass=ROBOT_MASS)
         self.robots = [self.robot1, self.robot2]
         self.done = False
 
@@ -67,8 +67,12 @@ class SumoEnv:
         self.last_action2 = action2
 
         for r, action in zip(self.robots, [action1, action2]):
-            r.compute_dynamics(action[0], action[1])
-            r.compute_kinematics()
+    # Convert tensors to simple float numbers
+    # This ensures the physics engine is working with numbers, not tensors
+            a_l = float(action[0]) if torch.is_tensor(action[0]) else action[0]
+            a_r = float(action[1]) if torch.is_tensor(action[1]) else action[1]
+            r.compute_dynamics(a_l, a_r)
+            r.compute_kinematics(dt=1.0)
 
         is_collision = self._handle_collisions()
 
@@ -97,12 +101,14 @@ class SumoEnv:
             m1, m2 = self.robot1.mass, self.robot2.mass
             total_mass = m1 + m2
 
+            # --- 1. Position Correction (Prevent Overlap) ---
             push = axis * (overlap + 0.1)
             self.robot1.x -= push[0] * (m2 / total_mass)
             self.robot1.y -= push[1] * (m2 / total_mass)
             self.robot2.x += push[0] * (m1 / total_mass)
             self.robot2.y += push[1] * (m1 / total_mass)
 
+            # --- 2. Velocity Analysis ---
             gv1 = get_robot_global_velocity(self.robot1)
             gv2 = get_robot_global_velocity(self.robot2)
             v_rel_normal = np.dot(gv1 - gv2, axis)
@@ -112,20 +118,68 @@ class SumoEnv:
                 impulse_mag = (1 + restitution) * v_rel_normal / (1 / m1 + 1 / m2)
                 impulse_vec = impulse_mag * axis
 
-                self.robot1.apply_impulse(-impulse_vec)
-                self.robot2.apply_impulse(impulse_vec)
+                # Calculate direction-based multipliers
+                forward1 = np.array([math.cos(math.radians(self.robot1.angle)), math.sin(math.radians(self.robot1.angle))])
+                cos_angle1 = np.dot(axis, forward1)
+                if cos_angle1 > 0.5:
+                    mult1 = PUSH_BACK_MULT
+                elif cos_angle1 < -0.5:
+                    mult1 = PUSH_FRONT_MULT
+                else:
+                    mult1 = PUSH_SIDE_MULT
 
-                self.robot1.v_side *= 0.2
-                self.robot2.v_side *= 0.2
-                self.robot1.omega *= 0.3
-                self.robot2.omega *= 0.3
+                forward2 = np.array([math.cos(math.radians(self.robot2.angle)), math.sin(math.radians(self.robot2.angle))])
+                cos_angle2 = np.dot(axis, forward2)
+                if cos_angle2 > 0.5:
+                    mult2 = PUSH_BACK_MULT
+                elif cos_angle2 < -0.5:
+                    mult2 = PUSH_FRONT_MULT
+                else:
+                    mult2 = PUSH_SIDE_MULT
+
+                # BREAKING STATIC FRICTION LOGIC
+                # Define a threshold (adjust this in config.py)
+                IMPACT_THRESHOLD = 0.8 
+
+                if impulse_mag > IMPACT_THRESHOLD:
+                    # If the hit is hard enough, the robots "lose their footing"
+                    # We reduce the dampening so the impulse carries them further
+                    stability_multiplier = 0.8  # Less dampening = more sliding
+                else:
+                    stability_multiplier = 0.3  # High dampening = stable (current behavior)
+
+                self.robot1.apply_impulse(-impulse_vec * mult1)
+                self.robot2.apply_impulse(impulse_vec * mult2)
+
+                # Apply the dynamic stability based on impact
+                self.robot1.v_side *= stability_multiplier
+                self.robot2.v_side *= stability_multiplier
+                self.robot1.omega *= (stability_multiplier + 0.1)
+                self.robot2.omega *= (stability_multiplier + 0.1)
+
+                # --- 4. FRICTION BREAK (The la pièce de résistance) ---
+                # If the impact is violent enough (e.g. > 0.5 m/s), 
+                # both robots lose their static grip and enter dynamic slip.
+                if v_rel_normal > 0.9:
+                    # We set a flag on the robots. 
+                    # The robot.py compute_dynamics will check this flag.
+                    self.robot1.is_slipping = True 
+                    self.robot2.is_slipping = True
+                # --- 5. Soften the Damping ---
+                # Original code used 0.2 (killed 80% of velocity). 
+                # We use 0.6 (kills 40%) to let the momentum carry the robot.
+                self.robot1.v_side *= 0.6
+                self.robot2.v_side *= 0.6
+                self.robot1.omega *= 0.7
+                self.robot2.omega *= 0.7
 
             return True
         return False
 
+
     def _generate_start_positions(self, randPositions):
         dist = self.ARENA_RADIUS * 0.7
-        line_angle_deg = np.random.uniform(0, 360) if randPositions else 0.0
+        line_angle_deg = np.random.uniform(-180, 180) if randPositions else 0.0
         rad = np.radians(line_angle_deg)
 
         off_x = dist * np.cos(rad)
@@ -136,8 +190,8 @@ class SumoEnv:
         r2_x = off_x
         r2_y = off_y
 
-        r1_angle = line_angle_deg
-        r2_angle = (line_angle_deg + 180) % 360
+        r1_angle = line_angle_deg + np.random.uniform(-100, 100)
+        r2_angle = (line_angle_deg + 180 + np.random.uniform(-100, 100)) % 360
 
         return {"x": r1_x, "y": r1_y, "angle": r1_angle}, {
             "x": r2_x,
@@ -146,61 +200,86 @@ class SumoEnv:
         }
 
     def _get_state_vec(self, viewer, target):
-        v_fwd = viewer.v
-        v_side = viewer.v_side
-        omega = viewer.omega
-        global_angle_rad = math.radians(viewer.angle % 360)
+        # 1. Observed State (SENSORS)
+        v_wheel_l = getattr(viewer, 'wheel_l_speed', 0.0)
+        v_wheel_r = getattr(viewer, 'wheel_r_speed', 0.0)
+        omega = viewer.omega / ROTATE_SPEED if ROTATE_SPEED != 0 else 0
+        
+        curr_l = getattr(viewer, 'current_l', 0.0)
+        curr_r = getattr(viewer, 'current_r', 0.0)
+        
+        # 2. Opponent Sensors (TIGHTENED LOGIC)
+        sensor_angles = [-20, 0, 20, -90, 90] 
+        opp_distances = []
+        
+        # IMPORTANT: Explicitly calculate distance between the two robots
+        dx = target.x - viewer.x
+        dy = target.y - viewer.y
+        dist_to_opp = math.hypot(dx, dy)
+        
+        # SAFETY CHECK: If distance is 0 but robots aren't the same, 
+        # it's a physics glitch. We prevent it here.
+        if dist_to_opp < 0.1: 
+            # If they are practically touching, we use a small value 
+            # instead of absolute 0 to prevent division errors
+            dist_to_opp = max(dist_to_opp, 0.01)
 
-        dx_opp = target.x - viewer.x
-        dy_opp = target.y - viewer.y
-        dist_opp = math.hypot(dx_opp, dy_opp)
+        angle_to_opp_global = math.atan2(dy, dx)
+        robot_rad = math.radians(viewer.angle % 360)
+        
+        for angle_deg in sensor_angles:
+            ray_rad = robot_rad + math.radians(angle_deg)
+            diff = angle_to_opp_global - ray_rad
+            diff = (diff + math.pi) % (2 * math.pi) - math.pi
+            
+            # Use a tighter cone (10 degrees instead of 15) for better accuracy
+            if abs(diff) < math.radians(10):
+                # Normalize distance: 0.0 (touching) to 1.0 (edge of arena)
+                norm_dist = dist_to_opp / (self.ARENA_RADIUS * 2)
+                opp_distances.append(np.clip(norm_dist, 0.0, 1.0))
+            else:
+                opp_distances.append(1.0) # Sensor sees nothing
 
-        angle_to_opp_raw = math.atan2(dy_opp, dx_opp) - global_angle_rad
-        angle_to_opp = (angle_to_opp_raw + math.pi) % (2 * math.pi) - math.pi
-
-        dist_to_center = math.hypot(viewer.x, viewer.y)
-        dist_to_edge = self.ARENA_RADIUS - dist_to_center
-
-        angle_to_center_raw = math.atan2(-viewer.y, -viewer.x) - global_angle_rad
-        angle_to_center = (angle_to_center_raw + math.pi) % (2 * math.pi) - math.pi
+        # 3. Multi-Point Line Sensors
+        corners = viewer.get_corners() 
+        fl_dist = math.hypot(corners[3][0], corners[3][1])
+        s_fl_line = 1.0 if fl_dist >= self.ARENA_RADIUS - 40 else 0.0
+        fr_dist = math.hypot(corners[2][0], corners[2][1])
+        s_fr_line = 1.0 if fr_dist >= self.ARENA_RADIUS - 40 else 0.0
+        back_center = (corners[0] + corners[1]) / 2
+        bc_dist = math.hypot(back_center[0], back_center[1])
+        s_bc_line = 1.0 if bc_dist >= self.ARENA_RADIUS - 40 else 0.0
 
         return np.array(
             [
-                v_fwd / MAX_SPEED,
-                v_side / MAX_SPEED,
-                omega / ROTATE_SPEED,
-                math.sin(global_angle_rad),
-                math.cos(global_angle_rad),
-                dist_opp / (ARENA_RADIUS * 2),
-                math.sin(angle_to_opp),
-                math.cos(angle_to_opp),
-                dist_to_edge / ARENA_RADIUS,
-                math.sin(angle_to_center),
-                math.cos(angle_to_center),
+                v_wheel_l, v_wheel_r, omega, # 0, 1, 2
+                curr_l, curr_r,             # 3, 4
+                *opp_distances,             # 5, 6, 7, 8, 9
+                s_fl_line, s_fr_line, s_bc_line # 10, 11, 12
             ],
             dtype=np.float32,
         )
 
+
     def _get_all_state_vecs(self):
-        return [
+        state_vecs = [
             self._get_state_vec(self.robot1, self.robot2),
             self._get_state_vec(self.robot2, self.robot1),
         ]
+        self.robot1.state_vec = state_vecs[0]
+        self.robot2.state_vec = state_vecs[1]
+        return state_vecs
 
     def _calculate_env_logic(self):
         winner = 0
+        # Only check the CENTER of the robot
         for idx, r in enumerate(self.robots):
-            corners = r.get_corners()
-            for corner in corners:
-                dist = math.hypot(corner[0], corner[1])
-                if dist > self.ARENA_RADIUS:
-                    self.done = True
-                    winner = 2 if idx == 0 else 1
-                    break
-            if self.done:
+            dist_to_center = math.hypot(r.x, r.y)
+            if dist_to_center > self.ARENA_RADIUS:
+                self.done = True
+                winner = 2 if idx == 0 else 1
                 break
         return self._get_all_state_vecs(), [0.0, 0.0], self.done, {"winner": winner}
-
     def render(self, names=None, archs=None):
         if not self.render_mode or self.renderer is None:
             return

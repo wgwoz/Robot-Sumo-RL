@@ -37,7 +37,7 @@ def check_sat_collision(corners1, corners2):
 
 
 def get_robot_global_velocity(robot):
-    rad = math.radians(-robot.angle)
+    rad = math.radians(robot.angle) # Removed the minus sign
     forward_vec = np.array([math.cos(rad), math.sin(rad)])
-    side_vec = np.array([math.cos(rad + math.pi / 2), math.sin(rad + math.pi / 2)])
+    side_vec = np.array([-math.sin(rad), math.cos(rad)]) # Matches robot.py perfectly
     return robot.v * forward_vec + robot.v_side * side_vec

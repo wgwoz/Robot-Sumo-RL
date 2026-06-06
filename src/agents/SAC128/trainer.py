@@ -9,10 +9,10 @@ import numpy as np
 import pygame
 import torch
 
-from src.agents.SAC.agent import ReplayBuffer, SACAgent
-from src.agents.SAC.networks import GaussianActor
+from src.agents.SAC128.agent import ReplayBuffer, SAC128Agent
+from src.agents.SAC128.networks import GaussianActor
 from src.agents.PPO.agent import create_agent, get_distribution
-from src.agents.SAC.rewards import get_reward
+from src.agents.SAC128.rewards import get_reward
 from src.env.sumo_env import SumoEnv
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
@@ -21,21 +21,44 @@ cfg = {
     "lr": 3e-4,
     "gamma": 0.99,
     "tau": 0.005,
-    "batch_size": 256,
+    "batch_size": 128,
     "buffer_capacity": 1000000,
     "start_steps": 10000,
     "update_after": 300,
     "max_steps": 600, # Balanced for navigation and aggression
     "episodes": 10000000,
     "render": False,
-    "num_workers": 4, 
-    "master_path": os.path.join(ROOT_DIR, "models/SAC_sumo_master.pt"),
+    "num_workers": 4,
+    "master_path": os.path.join(ROOT_DIR, "models/SAC128_sumo_master_128.pt"),
+    "legacy_master_path": os.path.join(ROOT_DIR, "models/SAC128_sumo_master.pt"),
     "ppo_master_path": os.path.join(ROOT_DIR, "models/ppo_sumo_master.pt"),
     "model_dir": os.path.join(ROOT_DIR, "models/"),
 }
 
 def get_history_models(dir):
     return glob.glob(os.path.join(dir, "model_v*.pt"))
+
+
+def safe_load_state_dict(model, path):
+    sd = torch.load(path, map_location="cpu")
+    own_state = model.state_dict()
+    loaded_count = 0
+
+    for key, value in sd.items():
+        if key not in own_state:
+            continue
+        if value.shape == own_state[key].shape:
+            own_state[key].copy_(value)
+            loaded_count += 1
+        else:
+            print(f"Skipping incompatible key {key}: {value.shape} -> {own_state[key].shape}")
+
+    if loaded_count > 0:
+        return True
+
+    print(f"Warning: No compatible weights could be loaded from {path}.")
+    return False
+
 
 def load_opponent_net(opp_path, device):
     sd = torch.load(opp_path, map_location=device)
@@ -60,13 +83,13 @@ def load_opponent_net(opp_path, device):
     opp_net = GaussianActor(13, 2).to(device).eval()
     actor_sd = {k[6:]: v for k, v in sd.items() if k.startswith("actor.")}
     opp_net.load_state_dict(actor_sd or sd)
-    return opp_net, "SAC"
+    return opp_net, "SAC128"
 
 
 def collect_experiences(agent_state, opp_path, cfg, total_steps):
     """Collect experiences. If opp_path is None, the opponent is a stationary dummy."""
     device = torch.device("cpu")
-    agent = SACAgent(obs_size=13, action_dim=2, device=device, lr=cfg["lr"])
+    agent = SAC128Agent(obs_size=13, action_dim=2, device=device, hidden_dim=128, lr=cfg["lr"])
     agent.load_state_dict(agent_state)
 
     opp_net = None
@@ -128,17 +151,28 @@ def collect_experiences(agent_state, opp_path, cfg, total_steps):
     return experiences, winner, ep_rew
 
 def train():
-    """Main training loop for the SAC agent."""
+    """Main training loop for the SAC128 agent."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    history_dir = os.path.join(cfg["model_dir"], "history/SAC")
+    history_dir = os.path.join(cfg["model_dir"], "history/SAC128")
     os.makedirs(history_dir, exist_ok=True)
 
-    agent = SACAgent(obs_size=13, action_dim=2, device=device, lr=cfg["lr"])
+    agent = SAC128Agent(obs_size=13, action_dim=2, device=device, hidden_dim=128, lr=cfg["lr"])
     memory = ReplayBuffer(cfg["buffer_capacity"])
 
     if os.path.exists(cfg["master_path"]):
-        agent.load_state_dict(torch.load(cfg["master_path"], map_location=device))
-        print("Loaded MASTER model. Resuming training...")
+        loaded_ok = safe_load_state_dict(agent, cfg["master_path"])
+        if loaded_ok:
+            print("Loaded MASTER model. Resuming training...")
+        else:
+            print("Loaded partial checkpoint into smaller SAC128 model. Training will continue with compatible weights only.")
+    elif os.path.exists(cfg["legacy_master_path"]):
+        loaded_ok = safe_load_state_dict(agent, cfg["legacy_master_path"])
+        if loaded_ok:
+            print("Loaded legacy SAC128 checkpoint into smaller model.")
+        else:
+            print("Legacy SAC128 checkpoint incompatible; starting fresh smaller model.")
+        torch.save(agent.state_dict(), cfg["master_path"])
+        print("Saved new smaller master checkpoint to the new path.")
     else:
         torch.save(agent.state_dict(), cfg["master_path"])
 
@@ -188,7 +222,7 @@ def train():
 
                     val_state, _, val_done, info = val_env.step(act_np, opp_act_np)
                     val_steps += 1
-                    val_env.render(names=["Training AI", "Master"], archs=["SAC", "SAC"])
+                    val_env.render(names=["Training AI", "Master"], archs=["SAC128", "SAC128"])
                 
                 # Close the validation window to free resources
                 pygame.display.quit()
@@ -199,7 +233,7 @@ def train():
             if cross_play:
                 opp_path = cfg["ppo_master_path"]
                 opp_name = "PPO_MASTER"
-                is_master = False  # Cross-play should not affect SAC master win_history
+                is_master = False  # Cross-play should not affect SAC128 master win_history
             else:
                 hist = get_history_models(history_dir)
                 is_master = random.random() >= 0.20 or not hist
