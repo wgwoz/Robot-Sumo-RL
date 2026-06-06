@@ -12,6 +12,22 @@
 
 # Robot Sumo RL Training System
 
+## **CHANGES BY ME (wgwoz)**
+
+I have forked this repo and used most of it functionality. I have changed size of model and robot inputs/outputs, in order to make it more realistic and later deployed to phisical robot.
+- 5 analog opponent sensors
+- 3 digital line sensors
+- differential drive
+I have also changed  phisics model to better fit my goals.
+- slippage and wheel spinout (the later deactivated)
+- momentum
+- better traction from front than from sides/back to promote flanking
+
+I have modified reward function extensivley and trained 3 models. SAC, SAC128 and PPO. In my findings, SAC128 started performing the best followed by PPO followed by SAC. It seems that SAC strarted to overfit. 
+
+Most of the work was made by Sebastian, the original author, I have adapted his codebase to my needs. I have used help of copilot and codebase is not tidy rn
+
+
 > [!IMPORTANT]
 >  State-of-the-Art (SOTA) Implementation: As of January 2026, this repository represents the most advanced open-source framework for Robot Sumo combat, being the first to provide a comprehensive benchmark of SAC, PPO, and A2C algorithms integrated with a competitive self-play mechanism.
 
